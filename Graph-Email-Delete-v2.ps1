@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-Connects to Microsoft Graph to retrieve and optionally delete email messages from a specific sender in a user's inbox.
+Connects to Microsoft Graph to retrieve and optionally delete email messages from a specific sender based on the sender's email address in the message headers, optimized to avoid throttling and appending output to a CSV file.
 
 .DESCRIPTION
-The script connects to Microsoft Graph Beta using client credentials to access a specified user's inbox. It retrieves messages directly using OData filters based on the sender's email address and optionally deletes them.
+The script connects to Microsoft Graph Beta using client credentials to access a specified user's inbox. It retrieves messages in batches and includes retry logic with exponential backoff to handle throttling. It filters messages by examining the 'internetMessageHeaders' to find messages where the sender's email address matches the specified address. Optionally, it can delete those messages and appends the output to a CSV file.
 
 .PARAMETER ClientId
 Client ID used for the application to authenticate with Microsoft Graph.
@@ -20,6 +20,12 @@ The email address or User Principal Name (UPN) of the user whose inbox will be q
 .PARAMETER SenderEmail
 The email address of the sender whose messages will be retrieved and optionally deleted.
 
+.PARAMETER OutputCsvPath
+The file path of the CSV file where the output will be appended.
+
+.PARAMETER DaysToSearch
+The number of days to look back when searching for messages.
+
 .PARAMETER DeleteMessages
 Switch parameter to indicate if messages should be deleted.
 
@@ -27,7 +33,7 @@ Switch parameter to indicate if messages should be deleted.
 Author: Jeffrey "Gig-E" Arsenault, TwistedLogic, LLC
 Email: jeff@twistedlogic.io
 Date: 18 Sep 2024
-Version: 1.1
+Version: 1.6
 
 Before running, ensure you have the latest versions of the following modules installed:
 Install-Module Microsoft.Graph -AllowClobber -Force
@@ -52,6 +58,10 @@ param(
     [string]$UserId,
     [Parameter(Mandatory = $true)]
     [string]$SenderEmail,
+    [Parameter(Mandatory = $true)]
+    [string]$OutputCsvPath,
+    [Parameter(Mandatory = $true)]
+    [int]$DaysToSearch,
     [switch]$DeleteMessages
 )
 
@@ -64,30 +74,147 @@ $ClientSecretCredential = New-Object -TypeName System.Management.Automation.PSCr
 # Connect to Microsoft Graph
 Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $ClientSecretCredential -NoWelcome
 
-# Build the OData filter query
-$filter = "from/emailAddress/address eq '$SenderEmail'"
+# Initialize variables for throttling
+$maxRetries = 5
+$retryDelay = 2 # Initial delay in seconds
 
-# Get messages directly filtered by sender's email address
-$messages = Get-MgBetaUserMessage -UserId $UserId -Filter $filter -All
-
-if ($messages.Count -eq 0) {
-    Write-Output "No messages found from sender '$SenderEmail' in user '$UserId' inbox."
-} else {
-    $count = 0
-    foreach ($message in $messages) {
-        $count++
-        Write-Output "$count - $($message.SentDateTime) - Subject: $($message.Subject) - Sender: $($message.Sender.EmailAddress.Address)"
-        if ($DeleteMessages.IsPresent) {
-            try {
-                Remove-MgBetaUserMessage -UserId $UserId -MessageId $message.Id -Confirm:$false
-                Write-Output "Message ID $($message.Id) deleted."
-            } catch {
-                Write-Error "Failed to delete message ID $($message.Id): $_"
+# Function to handle API calls with retry logic
+function Invoke-WithRetry {
+    param (
+        [ScriptBlock]$ScriptBlock
+    )
+    $retryCount = 0
+    while ($true) {
+        try {
+            return & $ScriptBlock
+        } catch {
+            if ($_.Exception.Response.StatusCode -eq 429 -or $_.Exception.Response.StatusCode -eq 503) {
+                $retryCount++
+                if ($retryCount -gt $maxRetries) {
+                    throw "Maximum retry attempts exceeded."
+                }
+                $retryAfter = $_.Exception.Response.Headers['Retry-After']
+                if ($retryAfter) {
+                    $sleepSeconds = [int]$retryAfter
+                } else {
+                    $sleepSeconds = $retryDelay * [math]::Pow(2, $retryCount)
+                }
+                Write-Warning "Throttled by server. Waiting $sleepSeconds seconds before retrying..."
+                Start-Sleep -Seconds $sleepSeconds
+            } else {
+                throw $_
             }
         }
     }
-    Write-Output "$count messages processed."
 }
+
+# Specify the date range based on the DaysToSearch parameter
+$startDateTime = (Get-Date).AddDays(-$DaysToSearch).ToString("o")
+$filterDate = "receivedDateTime ge $startDateTime"
+
+# Set batch size (number of messages per request)
+$batchSize = 50
+
+# Initialize pagination variables
+$morePages = $true
+$nextLink = $null
+
+$count = 0
+$totalProcessed = 0
+
+# Prepare CSV output
+$csvHeaders = @('UserId', 'MessageId', 'SentDateTime', 'Subject', 'SenderEmail', 'Deleted')
+if (-not (Test-Path -Path $OutputCsvPath)) {
+    # Create CSV file with headers if it doesn't exist
+    $null = Out-File -FilePath $OutputCsvPath -Encoding UTF8 -Force
+    $csvHeaders | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Out-File -FilePath $OutputCsvPath -Append -Encoding UTF8
+}
+
+Write-Output "Starting message retrieval and processing..."
+
+while ($morePages) {
+    # Build query parameters
+    $queryParameters = @{
+        'Filter' = $filterDate
+        'Top'    = $batchSize
+        'Select' = 'id,sentDateTime,subject,sender'
+    }
+
+    if ($nextLink) {
+        # If there's a nextLink from previous response, use it
+        $response = Invoke-WithRetry { Invoke-MgGraphRequest -Uri $nextLink -Method GET }
+    } else {
+        # Initial request
+        $response = Invoke-WithRetry { Get-MgBetaUserMessage -UserId $UserId @queryParameters }
+    }
+
+    # Process messages
+    foreach ($message in $response.Value) {
+        # Retrieve the message with internetMessageHeaders using -Select
+        $messageDetail = Invoke-WithRetry {
+            Get-MgBetaUserMessage -UserId $UserId -MessageId $message.Id -Select 'internetMessageHeaders,sentDateTime,subject,sender'
+        }
+
+        # Initialize flag to check if sender's email is in headers
+        $senderInHeaders = $false
+
+        # Loop through headers to find the sender's email address
+        foreach ($header in $messageDetail.InternetMessageHeaders) {
+            if ($header.Name -match '^(From|Sender|Return-Path)$') {
+                if ($header.Value -like "*$SenderEmail*") {
+                    $senderInHeaders = $true
+                    break
+                }
+            }
+        }
+
+        if ($senderInHeaders) {
+            $count++
+            Write-Output "$count - $($messageDetail.SentDateTime) - Subject: $($messageDetail.Subject) - Sender in Headers: $SenderEmail"
+            $deletedStatus = $false
+            if ($DeleteMessages.IsPresent) {
+                try {
+                    Invoke-WithRetry {
+                        Remove-MgBetaUserMessage -UserId $UserId -MessageId $message.Id -Confirm:$false
+                    }
+                    Write-Output "Message ID $($message.Id) deleted."
+                    $deletedStatus = $true
+                } catch {
+                    Write-Error "Failed to delete message ID $($message.Id): $_"
+                }
+            }
+
+            # Prepare data for CSV
+            $csvData = [PSCustomObject]@{
+                UserId        = $UserId
+                MessageId     = $message.Id
+                SentDateTime  = $messageDetail.SentDateTime
+                Subject       = $messageDetail.Subject
+                SenderEmail   = $SenderEmail
+                Deleted       = $deletedStatus
+            }
+
+            # Append data to CSV
+            $csvData | ConvertTo-Csv -NoTypeInformation | Select-Object -Skip 1 | Out-File -FilePath $OutputCsvPath -Append -Encoding UTF8
+        }
+
+        # Optional: Include a short delay between message processing
+        Start-Sleep -Milliseconds 200
+    }
+
+    $totalProcessed += $response.Value.Count
+
+    # Check if there's a nextLink for pagination
+    if ($response.'@odata.nextLink') {
+        $nextLink = $response.'@odata.nextLink'
+        Write-Output "Processed $totalProcessed messages so far. Continuing to next batch..."
+    } else {
+        $morePages = $false
+    }
+}
+
+Write-Output "$count messages from sender '$SenderEmail' found in message headers and processed."
+Write-Output "Total messages processed: $totalProcessed"
 
 # Disconnect from Microsoft Graph
 Disconnect-MgGraph
